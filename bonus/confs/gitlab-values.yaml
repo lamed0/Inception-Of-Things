@@ -1,0 +1,44 @@
+installCertmanager: false
+
+certmanager-issuer:
+  email: admin@gitlab.local
+
+global:
+  edition: ce
+  hosts:
+    domain: local            # GitLab will be at gitlab.local
+    https: false
+  ingress:
+    enabled: true            # chart 10 defaults this to false
+    class: traefik           # use K3s's bundled Traefik
+    configureCertmanager: false
+    tls:
+      enabled: false
+  gatewayApi:
+    enabled: false           # chart 10 defaults this to true
+    installEnvoy: false      # separate switch for the Envoy subchart
+    configureCertmanager: false
+  kas:
+    enabled: false
+  registry:
+    enabled: false
+
+nginx-ingress:
+  enabled: false
+
+prometheus:
+  install: false
+
+gitlab-runner:
+  install: false
+
+gitlab:
+  webservice:
+    minReplicas: 1
+    maxReplicas: 1
+  sidekiq:
+    minReplicas: 1
+    maxReplicas: 1
+  gitaly:
+    persistence:
+      size: 5Gi
