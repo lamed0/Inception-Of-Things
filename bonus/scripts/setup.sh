@@ -7,6 +7,7 @@ GITLAB_CHART_REPO=https://gitlab.com/gitlab-org/charts/gitlab.git
 GITLAB_CHART_REF="2fc7f47418d09e0b44914d0e1ae3686f0e7be5e0"
 CHART_DIR="$HOME/.cache/iot-gitlab-chart"
 GL_TOKEN="iot-setup-token-0123456789"      # throwaway token for a local lab
+RESUME="${RESUME:-0}"                      # RESUME=1 skips cluster + GitLab install
 DIR="$(cd "$(dirname "$0")" && pwd)"
 CONFS="$DIR/../confs"
 
@@ -27,45 +28,85 @@ fi
 # --- Name resolution for GitLab (inside this machine) ---
 grep -q "gitlab.local" /etc/hosts || echo "127.0.0.1 gitlab.local" | sudo tee -a /etc/hosts >/dev/null
 
-echo "==> (Re)creating cluster '$CLUSTER'"
-k3d cluster delete "$CLUSTER" 2>/dev/null || true
-k3d cluster create "$CLUSTER" \
-  -p "8888:30080@agent:0" \
-  -p "8080:30081@agent:0" \
-  -p "80:80@loadbalancer" \
-  --agents 1
-kubectl wait --for=condition=Ready nodes --all --timeout=180s
+# Wait until pods matching a label exist, then until they are Ready
+wait_for_pod() {   # usage: wait_for_pod <label> <namespace> <timeout>
+  local label=$1 ns=$2 timeout=$3
+  for i in $(seq 1 60); do
+    kubectl get pod -l "$label" -n "$ns" --no-headers 2>/dev/null | grep -q . && break
+    sleep 5
+  done
+  kubectl wait --for=condition=Ready pod -l "$label" -n "$ns" --timeout="$timeout"
+}
 
-echo "==> Waiting for Traefik (bundled ingress)"
-for i in $(seq 1 60); do
-  kubectl -n kube-system get deploy traefik >/dev/null 2>&1 && break
-  sleep 5
-done
-kubectl -n kube-system rollout status deploy/traefik --timeout=300s
+if [ "$RESUME" != "1" ]; then
 
-# --- GitLab chart, pinned to a known-good commit ---
-echo "==> Fetching GitLab chart ($GITLAB_CHART_REF)"
-[ -d "$CHART_DIR/.git" ] || git clone "$GITLAB_CHART_REPO" "$CHART_DIR"
-git -C "$CHART_DIR" fetch --quiet origin || true
-git -C "$CHART_DIR" checkout --quiet "$GITLAB_CHART_REF"
+  echo "==> (Re)creating cluster '$CLUSTER'"
+  k3d cluster delete "$CLUSTER" 2>/dev/null || true
+  k3d cluster create "$CLUSTER" \
+    -p "8888:30080@agent:0" \
+    -p "8080:30081@agent:0" \
+    -p "80:80@loadbalancer" \
+    --agents 1
+  kubectl wait --for=condition=Ready nodes --all --timeout=180s
 
-echo "==> Provisioning PostgreSQL, Valkey and object storage"
-helm repo remove garage >/dev/null 2>&1 || true
-( cd "$CHART_DIR" && bash scripts/dev_dependencies.sh setup )
+  echo "==> Waiting for Traefik (bundled ingress)"
+  for i in $(seq 1 60); do
+    kubectl -n kube-system get deploy traefik >/dev/null 2>&1 && break
+    sleep 5
+  done
+  kubectl -n kube-system rollout status deploy/traefik --timeout=300s
 
-echo "==> Installing GitLab (10 to 20 minutes)"
-( cd "$CHART_DIR" \
-  && helm dependency update \
-  && helm upgrade --install gitlab . -n gitlab --create-namespace \
-       --skip-crds \
-       --timeout 900s \
-       -f .values/dev-external.values.yaml \
-       -f "$CONFS/gitlab-values.yaml" )
-# --skip-crds: K3s's bundled Traefik already provides the Gateway API CRDs
+  # --- GitLab chart, pinned to a known-good commit ---
+  echo "==> Fetching GitLab chart ($GITLAB_CHART_REF)"
+  [ -d "$CHART_DIR/.git" ] || git clone "$GITLAB_CHART_REPO" "$CHART_DIR"
+  git -C "$CHART_DIR" fetch --quiet origin || true
+  git -C "$CHART_DIR" checkout --quiet "$GITLAB_CHART_REF"
 
-echo "==> Waiting for GitLab to be ready"
-kubectl rollout status deploy/gitlab-webservice-default -n gitlab --timeout=1200s
-kubectl rollout status deploy/gitlab-toolbox -n gitlab --timeout=600s
+  echo "==> Provisioning PostgreSQL, Valkey and object storage"
+  helm repo remove garage >/dev/null 2>&1 || true
+  ( cd "$CHART_DIR" && bash scripts/dev_dependencies.sh setup )
+
+  # --- Pre-pull GitLab images on the host (resumable, with retries) ---
+  echo "==> Listing GitLab images"
+  IMAGES=$( cd "$CHART_DIR" && helm dependency update >/dev/null 2>&1 \
+    && helm template gitlab . -n gitlab --skip-crds \
+         -f .values/dev-external.values.yaml \
+         -f "$CONFS/gitlab-values.yaml" 2>/dev/null \
+    | grep -E '^\s*-?\s*image:' | sed -E 's/.*image:[[:space:]]*//; s/"//g' | sort -u || true )
+
+  if [ -z "$IMAGES" ]; then
+    echo "!! Could not list the GitLab images, pods will pull them themselves (slower)"
+  else
+    echo "==> Pre-pulling $(echo "$IMAGES" | wc -l) images"
+    for img in $IMAGES; do
+      echo "  - $img"
+      ok=0
+      for i in 1 2 3 4 5; do
+        if docker pull -q "$img" >/dev/null 2>&1; then ok=1; break; fi
+        sleep 10
+      done
+      if [ "$ok" = "1" ]; then
+        k3d image import "$img" -c "$CLUSTER" >/dev/null 2>&1 || echo "    (import failed, the node will pull it)"
+      else
+        echo "    (pull failed, the node will retry)"
+      fi
+    done
+  fi
+
+  echo "==> Installing GitLab"
+  ( cd "$CHART_DIR" \
+    && helm upgrade --install gitlab . -n gitlab --create-namespace \
+         --skip-crds \
+         --timeout 900s \
+         -f .values/dev-external.values.yaml \
+         -f "$CONFS/gitlab-values.yaml" )
+  # --skip-crds: K3s's bundled Traefik already provides the Gateway API CRDs
+
+fi
+
+echo "==> Waiting for GitLab to be ready (can be slow on a first run)"
+wait_for_pod app=webservice gitlab 2400s
+wait_for_pod app=toolbox gitlab 600s
 
 # --- Create the project and push the manifests ---
 echo "==> Creating an API token for root"
@@ -98,7 +139,8 @@ cp -r "$CONFS/manifests" "$WORK/manifests"
   && git init -q -b main \
   && git add . \
   && git -c user.name=iot -c user.email=iot@gitlab.local commit -q -m "initial manifests" \
-  && git push -q "http://root:$GL_TOKEN@gitlab.local/root/mlamrani.git" main )
+  && git push -q "http://root:$GL_TOKEN@gitlab.local/root/mlamrani.git" main ) \
+  || echo "(push skipped or already done)"
 rm -rf "$WORK"
 
 # --- Argo CD ---
