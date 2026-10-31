@@ -28,6 +28,8 @@ fi
 # --- Name resolution for GitLab (inside this machine) ---
 grep -q "gitlab.local" /etc/hosts || echo "127.0.0.1 gitlab.local" | sudo tee -a /etc/hosts >/dev/null
 
+# --- Helpers ---------------------------------------------------------------
+
 # Wait until pods matching a label exist, then until they are Ready
 wait_for_pod() {   # usage: wait_for_pod <label> <namespace> <timeout>
   local label=$1 ns=$2 timeout=$3
@@ -38,6 +40,29 @@ wait_for_pod() {   # usage: wait_for_pod <label> <namespace> <timeout>
   kubectl wait --for=condition=Ready pod -l "$label" -n "$ns" --timeout="$timeout"
 }
 
+# Background helper: pull every image used in the gitlab namespace on the host
+# (resumable, with retries) and import it into the cluster
+prepull_loop() {
+  local seen=/tmp/iot-prepulled.txt
+  : > "$seen"
+  while true; do
+    for img in $(kubectl get pods -n gitlab -o jsonpath='{range .items[*]}{range .spec.initContainers[*]}{.image}{"\n"}{end}{range .spec.containers[*]}{.image}{"\n"}{end}{end}' 2>/dev/null | sort -u); do
+      grep -qxF "$img" "$seen" && continue
+      echo "$img" >> "$seen"
+      for i in 1 2 3 4 5; do docker pull -q "$img" >/dev/null 2>&1 && break || sleep 10; done
+      k3d image import "$img" -c "$CLUSTER" >/dev/null 2>&1 || true
+    done
+    sleep 10
+  done
+}
+
+PREPULL_PID=""
+stop_prepull() {
+  if [ -n "$PREPULL_PID" ]; then kill "$PREPULL_PID" 2>/dev/null || true; PREPULL_PID=""; fi
+}
+trap stop_prepull EXIT
+
+# --- Cluster, chart, dependencies, GitLab install ---------------------------
 if [ "$RESUME" != "1" ]; then
 
   echo "==> (Re)creating cluster '$CLUSTER'"
@@ -62,11 +87,23 @@ if [ "$RESUME" != "1" ]; then
   git -C "$CHART_DIR" fetch --quiet origin || true
   git -C "$CHART_DIR" checkout --quiet "$GITLAB_CHART_REF"
 
+  # --- Dependencies (PostgreSQL, Valkey, object storage), with retries ---
   echo "==> Provisioning PostgreSQL, Valkey and object storage"
   helm repo remove garage >/dev/null 2>&1 || true
-  ( cd "$CHART_DIR" && bash scripts/dev_dependencies.sh setup )
+  prepull_loop &
+  PREPULL_PID=$!
+  ok=0
+  for attempt in 1 2 3; do
+    if ( cd "$CHART_DIR" && bash scripts/dev_dependencies.sh setup ); then ok=1; break; fi
+    echo "!! dependency setup failed or timed out (attempt $attempt), retrying"
+    sleep 15
+  done
+  if [ "$ok" != "1" ]; then
+    echo "!! PostgreSQL/Valkey/Garage did not become ready"
+    exit 1
+  fi
 
-  # --- Pre-pull GitLab images on the host (resumable, with retries) ---
+  # --- Pre-pull the GitLab chart images on the host ---
   echo "==> Listing GitLab images"
   IMAGES=$( cd "$CHART_DIR" && helm dependency update >/dev/null 2>&1 \
     && helm template gitlab . -n gitlab --skip-crds \
@@ -75,7 +112,7 @@ if [ "$RESUME" != "1" ]; then
     | grep -E '^\s*-?\s*image:' | sed -E 's/.*image:[[:space:]]*//; s/"//g' | sort -u || true )
 
   if [ -z "$IMAGES" ]; then
-    echo "!! Could not list the GitLab images, pods will pull them themselves (slower)"
+    echo "!! Could not list the GitLab images, the background puller will handle them"
   else
     echo "==> Pre-pulling $(echo "$IMAGES" | wc -l) images"
     for img in $IMAGES; do
@@ -102,11 +139,15 @@ if [ "$RESUME" != "1" ]; then
          -f "$CONFS/gitlab-values.yaml" )
   # --skip-crds: K3s's bundled Traefik already provides the Gateway API CRDs
 
+else
+  echo "==> RESUME=1: skipping cluster creation and GitLab install"
+  [ -n "$PREPULL_PID" ] || { prepull_loop & PREPULL_PID=$!; }
 fi
 
 echo "==> Waiting for GitLab to be ready (can be slow on a first run)"
 wait_for_pod app=webservice gitlab 2400s
 wait_for_pod app=toolbox gitlab 600s
+stop_prepull
 
 # --- Create the project and push the manifests ---
 echo "==> Creating an API token for root"
