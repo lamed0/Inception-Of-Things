@@ -38,7 +38,7 @@ export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
 until kubectl get nodes 2>/dev/null | grep -q "Ready"; do
   sleep 2
 done
-mkdir -p $HOME/.kube
-sudo cp /etc/rancher/k3s/k3s.yaml $HOME/.kube/config
+mkdir -p /home/vagrant/.kube
+sudo cp /etc/rancher/k3s/k3s.yaml /home/vagrant/.kube/config
 echo "192.168.56.110 app1.com" | sudo tee -a /etc/hosts > /dev/null
 echo "[+] K3s server installed and verified ready."
